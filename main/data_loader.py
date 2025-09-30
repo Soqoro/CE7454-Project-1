@@ -3,6 +3,7 @@ import torchvision.datasets as dsets
 from torchvision import transforms
 from PIL import Image
 import os
+from pathlib import Path
 
 class CelebAMaskHQ():
     def __init__(self, img_path, label_path, transform_img, transform_label, mode):
@@ -21,17 +22,31 @@ class CelebAMaskHQ():
             self.num_images = len(self.test_dataset)
 
     def preprocess(self):
-        
-        for i in range(len([name for name in os.listdir(self.img_path) if os.path.isfile(os.path.join(self.img_path, name))])):
-            img_path = os.path.join(self.img_path, str(i)+'.jpg')
-            label_path = os.path.join(self.label_path, str(i)+'.png')
-            print (img_path, label_path) 
-            if self.mode == True:
-                self.train_dataset.append([img_path, label_path])
-            else:
-                self.test_dataset.append([img_path, label_path])
-            
-        print('Finished preprocessing the CelebA dataset...')
+        img_dir = Path(self.img_path)
+        label_dir = Path(self.label_path)
+
+        img_files = sorted(p for p in img_dir.iterdir() if p.is_file())
+        found = 0
+        missing = 0
+
+        for img in img_files:
+            stem = img.stem
+            # try common mask extensions
+            cand = [label_dir / f"{stem}.png", label_dir / f"{stem}.jpg", label_dir / f"{stem}.jpeg"]
+            mask = next((p for p in cand if p.exists()), None)
+            if mask is None:
+                print(f"WARNING: missing mask for {img.name}")
+                missing += 1
+                continue
+
+            pair = [str(img), str(mask)]
+            if self.mode:   # True = "train" in your code
+                self.train_dataset.append(pair)
+            else:           # False = "test/val"
+                self.test_dataset.append(pair)
+            found += 1
+
+        print(f"Finished preprocessing. Pairs found: {found}, missing masks: {missing}")
 
     def __getitem__(self, index):
         
