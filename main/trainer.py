@@ -4,15 +4,14 @@ import torch
 import datetime
 
 import torch.nn as nn
-from torch.autograd import Variable
 from torchvision.utils import save_image
-import numpy as np
 import torch.nn.functional as F
 
 from unet import unet
 from utils import *
 from tensorboardX import SummaryWriter
 writer = SummaryWriter('runs/training')
+
 
 class Trainer(object):
     def __init__(self, data_loader, config):
@@ -38,7 +37,7 @@ class Trainer(object):
 
         self.use_tensorboard = config.use_tensorboard
         self.img_path = config.img_path
-        self.label_path = config.label_path 
+        self.label_path = config.label_path
         self.log_path = config.log_path
         self.model_save_path = config.model_save_path
         self.sample_path = config.sample_path
@@ -47,10 +46,16 @@ class Trainer(object):
         self.model_save_step = config.model_save_step
         self.version = config.version
 
-        # Path
+        # Device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Paths
         self.log_path = os.path.join(config.log_path, self.version)
         self.sample_path = os.path.join(config.sample_path, self.version)
         self.model_save_path = os.path.join(config.model_save_path, self.version)
+        os.makedirs(self.sample_path, exist_ok=True)
+        os.makedirs(self.model_save_path, exist_ok=True)
+        os.makedirs(self.log_path, exist_ok=True)
 
         self.build_model()
 
@@ -69,10 +74,7 @@ class Trainer(object):
         model_save_step = int(self.model_save_step * step_per_epoch)
 
         # Start with trained model
-        if self.pretrained_model:
-            start = self.pretrained_model + 1
-        else:
-            start = 0
+        start = self.pretrained_model + 1 if self.pretrained_model else 0
 
         # Start time
         start_time = time.time()
@@ -81,24 +83,33 @@ class Trainer(object):
             self.G.train()
             try:
                 imgs, labels = next(data_iter)
-            except:
+            except Exception:
                 data_iter = iter(self.data_loader)
                 imgs, labels = next(data_iter)
 
+            # labels expected as [B,1,H,W] float in [0,1] from the patched dataloader
             size = labels.size()
+            # restore class ids 0..18
+            labels = labels.clone()
             labels[:, 0, :, :] = labels[:, 0, :, :] * 255.0
-            labels_real_plain = labels[:, 0, :, :].cuda()
-            labels = labels[:, 0, :, :].view(size[0], 1, size[2], size[3])
-            oneHot_size = (size[0], 19, size[2], size[3])
-            labels_real = torch.cuda.FloatTensor(torch.Size(oneHot_size)).zero_()
-            labels_real = labels_real.scatter_(1, labels.data.long().cuda(), 1.0)
 
-            imgs = imgs.cuda()
+            # targets
+            labels_real_plain = labels[:, 0, :, :].to(self.device)  # [B,H,W] long later
+            labels_index = labels[:, 0, :, :].view(size[0], 1, size[2], size[3])
+
+            # one-hot for visualization only
+            oneHot_size = (size[0], 19, size[2], size[3])
+            labels_real = torch.zeros(oneHot_size, dtype=torch.float32, device=self.device)
+            labels_real = labels_real.scatter_(1, labels_index.long().to(self.device), 1.0)
+
+            imgs = imgs.to(self.device, non_blocking=True)
+
             # ================== Train G =================== #
-            labels_predict = self.G(imgs)
-                       
-            # Calculate cross entropy loss
+            labels_predict = self.G(imgs)  # [B,19,H,W]
+
+            # Cross entropy expects target Long [B,H,W]
             c_loss = cross_entropy2d(labels_predict, labels_real_plain.long())
+
             self.reset_grad()
             c_loss.backward()
             self.g_optimizer.step()
@@ -106,60 +117,82 @@ class Trainer(object):
             # Print out log info
             if (step + 1) % self.log_step == 0:
                 elapsed = time.time() - start_time
-                elapsed = str(datetime.timedelta(seconds=elapsed))
-                print("Elapsed [{}], G_step [{}/{}], Cross_entrophy_loss: {:.4f}".
-                      format(elapsed, step + 1, self.total_step, c_loss.data))
+                elapsed = str(datetime.timedelta(seconds=int(elapsed)))
+                print("Elapsed [{}], G_step [{}/{}], Cross_entropy_loss: {:.4f}".format(
+                    elapsed, step + 1, self.total_step, c_loss.item()))
 
-            label_batch_predict = generate_label(labels_predict, self.imsize)
-            label_batch_real = generate_label(labels_real, self.imsize)
+            # Visualize labels (both real one-hot and predicted logits)
+            label_batch_predict = generate_label(labels_predict, self.imsize)  # Tensor
+            label_batch_real = generate_label(labels_real, self.imsize)        # Tensor
 
-            # scalr info on tensorboardX
-            writer.add_scalar('Loss/Cross_entrophy_loss', c_loss.data, step) 
+            # scalar info on tensorboardX
+            writer.add_scalar('Loss/Cross_entropy_loss', c_loss.item(), step)
 
-            # image infor on tensorboardX
+            # images on tensorboardX
+            B = imgs.shape[0]
             img_combine = imgs[0]
             real_combine = label_batch_real[0]
             predict_combine = label_batch_predict[0]
-            for i in range(1, self.batch_size):
+            for i in range(1, B):
                 img_combine = torch.cat([img_combine, imgs[i]], 2)
                 real_combine = torch.cat([real_combine, label_batch_real[i]], 2)
                 predict_combine = torch.cat([predict_combine, label_batch_predict[i]], 2)
-            writer.add_image('imresult/img', (img_combine.data + 1) / 2.0, step)
-            writer.add_image('imresult/real', real_combine, step)
-            writer.add_image('imresult/predict', predict_combine, step)
 
-            # Sample images
+            # inputs likely normalized to [-1,1]; map back to [0,1]
+            writer.add_image('imresult/img', (img_combine.detach() + 1) / 2.0, step)
+            writer.add_image('imresult/real', real_combine.detach(), step)
+            writer.add_image('imresult/predict', predict_combine.detach(), step)
+
+            # Sample images (save predicted labels grid)
             if (step + 1) % self.sample_step == 0:
                 labels_sample = self.G(imgs)
-                labels_sample = generate_label(labels_sample)
-                labels_sample = torch.from_numpy(labels_sample)
-                save_image(denorm(labels_sample.data),
-                           os.path.join(self.sample_path, '{}_predict.png'.format(step + 1)))
+                labels_sample = generate_label(labels_sample, self.imsize)  # returns Tensor
+                if isinstance(labels_sample, torch.Tensor):
+                    labels_sample = labels_sample.detach().cpu().float()
+                else:
+                    # fallback if it ever returns numpy
+                    import numpy as np
+                    if isinstance(labels_sample, np.ndarray):
+                        labels_sample = torch.from_numpy(labels_sample).float()
+                    else:
+                        raise TypeError(f"generate_label returned unsupported type: {type(labels_sample)}")
 
-            if (step+1) % model_save_step==0:
+                save_image(
+                    labels_sample,
+                    os.path.join(self.sample_path, f'{step + 1}_predict.png')
+                )
+
+            if (step + 1) % model_save_step == 0:
                 torch.save(self.G.state_dict(),
-                           os.path.join(self.model_save_path, '{}_G.pth'.format(step + 1)))
-    
+                           os.path.join(self.model_save_path, f'{step + 1}_G.pth'))
+
     def build_model(self):
 
-        self.G = unet().cuda()
+        self.G = unet().to(self.device)
         if self.parallel:
             self.G = nn.DataParallel(self.G)
 
-        # Loss and optimizer
-        self.g_optimizer = torch.optim.Adam(self.G.parameters(), self.g_lr, [self.beta1, self.beta2])
-        self.g_optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.G.parameters()), self.g_lr, [self.beta1, self.beta2])
+        # Loss and optimizer (use tuple for betas; remove duplicate assignment)
+        self.g_optimizer = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, self.G.parameters()),
+            lr=self.g_lr,
+            betas=(self.beta1, self.beta2)
+        )
 
         # print networks
         print(self.G)
 
     def build_tensorboard(self):
-        from logger import Logger
-        self.logger = Logger(self.log_path)
+        # Optional legacy logger; ignore if not present
+        try:
+            from logger import Logger  # type: ignore
+            self.logger = Logger(self.log_path)
+        except Exception:
+            self.logger = None
 
     def load_pretrained_model(self):
         self.G.load_state_dict(torch.load(os.path.join(
-            self.model_save_path, '{}_G.pth'.format(self.pretrained_model))))
+            self.model_save_path, '{}_G.pth'.format(self.pretrained_model)), map_location=self.device))
         print('loaded trained models (step: {})..!'.format(self.pretrained_model))
 
     def reset_grad(self):
