@@ -66,6 +66,10 @@ class Trainer(object):
         if self.pretrained_model:
             self.load_pretrained_model()
 
+    def _state_dict(self):
+        """Handle DataParallel transparently."""
+        return self.G.module.state_dict() if isinstance(self.G, nn.DataParallel) else self.G.state_dict()
+
     def train(self):
 
         # Data iterator
@@ -150,7 +154,6 @@ class Trainer(object):
                 if isinstance(labels_sample, torch.Tensor):
                     labels_sample = labels_sample.detach().cpu().float()
                 else:
-                    # fallback if it ever returns numpy
                     import numpy as np
                     if isinstance(labels_sample, np.ndarray):
                         labels_sample = torch.from_numpy(labels_sample).float()
@@ -162,15 +165,30 @@ class Trainer(object):
                     os.path.join(self.sample_path, f'{step + 1}_predict.png')
                 )
 
+            # ---------------------- CHECKPOINTING ----------------------
             if (step + 1) % model_save_step == 0:
-                torch.save(self.G.state_dict(),
+                # numbered checkpoint
+                torch.save(self._state_dict(),
                            os.path.join(self.model_save_path, f'{step + 1}_G.pth'))
+                # rolling/stable checkpoint for tester & sweeps
+                torch.save(self._state_dict(),
+                           os.path.join(self.model_save_path, 'latest_G.pth'))
+            # ----------------------------------------------------------
+
+        # Always leave a final rolling checkpoint even if loop ended off-cycle
+        torch.save(self._state_dict(),
+                   os.path.join(self.model_save_path, 'latest_G.pth'))
+        print(f'Final checkpoint saved to {os.path.join(self.model_save_path, "latest_G.pth")}')
 
     def build_model(self):
 
         self.G = unet().to(self.device)
         if self.parallel:
             self.G = nn.DataParallel(self.G)
+        
+        num_params = sum(p.numel() for p in self.G.parameters() if p.requires_grad)
+        assert num_params < 1_821_085, f"Model too large: {num_params} parameters (cap = 1,821,085)"
+        print(f"Trainable params: {num_params:,}")
 
         # Loss and optimizer (use tuple for betas; remove duplicate assignment)
         self.g_optimizer = torch.optim.Adam(
