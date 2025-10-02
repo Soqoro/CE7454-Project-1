@@ -1,4 +1,7 @@
 import os
+import glob
+from PIL import Image
+
 import torch
 import numpy as np
 import torch.nn.functional as F
@@ -163,10 +166,11 @@ def generate_label_plain(inputs, imsize):
 
 
 # ---------- loss ----------
-def cross_entropy2d(input, target, weight=None, size_average=True):
+def cross_entropy2d(input, target, weight=None, size_average=True, ignore_index=250):
     """
     input:  [B,C,H,W] logits
     target: [B,H,W]   long
+    ignore_index: label value to ignore (default 250)
     """
     n, c, h, w = input.size()
     nt, ht, wt = target.size()
@@ -179,5 +183,89 @@ def cross_entropy2d(input, target, weight=None, size_average=True):
     target = target.view(-1)                                     # [B*H*W]
 
     reduction = "mean" if size_average else "sum"
-    loss = F.cross_entropy(input, target, weight=weight, reduction=reduction, ignore_index=250)
+    loss = F.cross_entropy(input, target, weight=weight, reduction=reduction, ignore_index=ignore_index)
     return loss
+
+
+# ---------- NEW: soft dice (multi-class, ignore-aware) ----------
+def soft_dice_loss(logits, target, ignore_index=250, eps=1e-6):
+    """
+    logits: [B, C, H, W] (unnormalized)
+    target: [B, H, W] int labels in [0..C-1] or ignore_index
+    Returns scalar dice loss averaged over classes (ignores 'ignore_index').
+    """
+    B, C, H, W = logits.shape
+    probs = torch.softmax(logits, dim=1)              # [B,C,H,W]
+    valid = (target != ignore_index)                  # [B,H,W]
+    # zero ignore for one-hot, but mask them out anyway
+    t = target.clone()
+    t[~valid] = 0
+    onehot = F.one_hot(t.long(), num_classes=C).permute(0, 3, 1, 2).float()  # [B,C,H,W]
+
+    valid_f = valid.unsqueeze(1).float()
+    probs = probs * valid_f
+    onehot = onehot * valid_f
+
+    dims = (0, 2, 3)
+    inter = (probs * onehot).sum(dims)                # [C]
+    card  = (probs + onehot).sum(dims)                # [C]
+    dice = (2.0 * inter + eps) / (card + eps)         # [C]
+    return 1.0 - dice.mean()
+
+
+# ---------- NEW: class weights via median-frequency ----------
+def compute_class_weights(mask_dir, num_classes=19, ignore_index=250):
+    """
+    Scans PNG masks in mask_dir to compute median-frequency class weights.
+    Returns torch.FloatTensor [num_classes].
+    """
+    counts = np.zeros(num_classes, dtype=np.int64)
+    mask_paths = sorted(glob.glob(os.path.join(mask_dir, "*.png")))
+    for p in mask_paths:
+        arr = np.array(Image.open(p))  # keep as indices (palette or L)
+        vals, cnts = np.unique(arr, return_counts=True)
+        for v, c in zip(vals, cnts):
+            if v == ignore_index:
+                continue
+            if 0 <= v < num_classes:
+                counts[v] += int(c)
+
+    total = counts.sum()
+    if total == 0:
+        return torch.ones(num_classes, dtype=torch.float32)
+
+    freqs = counts / (total + 1e-12)
+    freqs_nonzero = freqs[freqs > 0]
+    if freqs_nonzero.size == 0:
+        return torch.ones(num_classes, dtype=torch.float32)
+
+    median_freq = np.median(freqs_nonzero)
+    weights = median_freq / (freqs + 1e-12)
+    weights[np.isinf(weights)] = 0.0
+    return torch.from_numpy(weights.astype(np.float32))
+
+
+# ---------- NEW: fast F1/mF1 helpers ----------
+def fast_hist_np(true_flat, pred_flat, num_classes, ignore_index=250):
+    """
+    Build confusion matrix (num_classes x num_classes) ignoring a label value.
+    Inputs: 1D numpy arrays of same length
+    """
+    mask = (true_flat != ignore_index)
+    true = true_flat[mask].astype(np.int64)
+    pred = pred_flat[mask].astype(np.int64)
+    hist = np.bincount(num_classes * true + pred, minlength=num_classes ** 2)
+    return hist.reshape(num_classes, num_classes)
+
+
+def f1_from_confusion(confusion):
+    """
+    Given confusion matrix, return per-class F1 (np.ndarray) and mean F1 (float).
+    """
+    tp = np.diag(confusion).astype(np.float64)
+    fp = confusion.sum(axis=0) - tp
+    fn = confusion.sum(axis=1) - tp
+    prec = tp / (tp + fp + 1e-12)
+    rec  = tp / (tp + fn + 1e-12)
+    f1 = 2.0 * prec * rec / (prec + rec + 1e-12)
+    return f1, float(np.nanmean(f1))

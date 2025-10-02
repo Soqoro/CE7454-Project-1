@@ -1,10 +1,116 @@
+import random
+from pathlib import Path
+from typing import List, Tuple
+
+import numpy as np
 import torch
+from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
-from PIL import Image
-from pathlib import Path
-from typing import List, Tuple
+import torchvision.transforms.functional as TF
+
+
+IGNORE_INDEX = 250  # keep consistent with training/eval
+
+
+# ---------------------------
+# Paired (image+mask) augmentation for train mode
+# ---------------------------
+class PairedAugment:
+    """
+    Apply the same geometric transform to image & mask.
+    - Geometry is done on tensors to satisfy torchvision type hints.
+    - Image: bilinear interpolation, RGB-only photometric jitter, optional cutout.
+    - Mask: nearest interpolation; out-of-bounds fill -> IGNORE_INDEX.
+    """
+
+    def __init__(
+        self,
+        hflip_p: float = 0.5,
+        degrees: float = 15.0,
+        translate: float = 0.05,            # fraction of width/height
+        scale_range: Tuple[float, float] = (0.9, 1.1),
+        shear: float = 5.0,
+        color_jitter: Tuple[float, float, float, float] = (0.2, 0.2, 0.15, 0.05),  # brightness, contrast, saturation, hue
+        cutout_p: float = 0.3,
+        cutout_size: int = 64,
+    ) -> None:
+        self.hflip_p = hflip_p
+        self.degrees = degrees
+        self.translate = translate
+        self.scale_range = scale_range
+        self.shear = shear
+        self.color_jitter = color_jitter
+        self.cutout_p = cutout_p
+        self.cutout_size = cutout_size
+
+    def __call__(self, img: Image.Image, mask: Image.Image) -> Tuple[Image.Image, Image.Image]:
+        """
+        Use tensor ops for geometry (matches TF type hints), then convert back to PIL.
+        - img_t: float32 [C,H,W] in [0,1]
+        - mask_t: uint8   [H,W]   (class indices)
+        """
+        # --- PIL -> Tensor
+        img_t = TF.pil_to_tensor(img).float() / 255.0          # [C,H,W], float in [0,1]
+        mask_t = TF.pil_to_tensor(mask).squeeze(0)             # [H,W], uint8
+
+        # --- Horizontal flip (tensor)
+        if random.random() < self.hflip_p:
+            img_t = torch.flip(img_t, dims=[-1])               # flip width
+            mask_t = torch.flip(mask_t, dims=[-1])
+
+        # --- Shared affine params
+        C = int(img_t.shape[0])
+        H = int(img_t.shape[-2])
+        W = int(img_t.shape[-1])
+
+        angle = float(random.uniform(-self.degrees, self.degrees))
+
+        max_dx = self.translate * W
+        max_dy = self.translate * H
+        # -> list[int] for type hints
+        translations = [int(round(random.uniform(-max_dx, max_dx))),
+                        int(round(random.uniform(-max_dy, max_dy)))]
+
+        scale = float(random.uniform(self.scale_range[0], self.scale_range[1]))
+        # -> list[float] (shear_x, shear_y)
+        shear = [float(random.uniform(-self.shear, self.shear)), 0.0]
+
+        # --- Apply affine
+        # fill: list[float] with length C for tensor images
+        img_fill = [0.0] * C
+        img_t = TF.affine(
+            img_t, angle=angle, translate=translations, scale=scale, shear=shear,
+            interpolation=InterpolationMode.BILINEAR, fill=img_fill
+        )  # -> float [C,H,W]
+
+        # mask_t is [H,W]; use channel dim for fill handling (length=1 list)
+        mask_fill = [float(IGNORE_INDEX)]
+        mask_t = TF.affine(
+            mask_t.unsqueeze(0), angle=angle, translate=translations, scale=scale, shear=shear,
+            interpolation=InterpolationMode.NEAREST, fill=mask_fill
+        ).squeeze(0).to(torch.uint8)  # -> uint8 [H,W]
+
+        # --- Photometric jitter (image only) on tensor
+        if self.color_jitter is not None:
+            b, c, s, h = self.color_jitter
+            img_t = TF.adjust_brightness(img_t, 1.0 + float(random.uniform(-b, b)))
+            img_t = TF.adjust_contrast(img_t,   1.0 + float(random.uniform(-c, c)))
+            img_t = TF.adjust_saturation(img_t, 1.0 + float(random.uniform(-s, s)))
+            img_t = TF.adjust_hue(img_t,                 float(random.uniform(-h, h)))
+
+        # --- Cutout (image only) on tensor
+        if random.random() < self.cutout_p:
+            sz = int(self.cutout_size)
+            x0 = int(random.randint(0, max(0, W - sz)))
+            y0 = int(random.randint(0, max(0, H - sz)))
+            img_t[:, y0:y0 + sz, x0:x0 + sz] = 0.0
+
+        # --- Tensor -> PIL (preserve downstream pipeline expectations)
+        img_out = TF.to_pil_image(img_t.clamp(0.0, 1.0))       # back to PIL RGB
+        mask_out = TF.to_pil_image(mask_t)                     # back to PIL L
+        return img_out, mask_out
 
 
 class CelebAMaskHQ(Dataset):
@@ -12,8 +118,9 @@ class CelebAMaskHQ(Dataset):
     - Discovers files from directories (no fixed numbering).
     - Pairs image<->mask by filename stem.
     - Skips items with missing masks.
-    - Returns labels as float [1,H,W] in [0,1] so trainer's '*255' restores 0..18.
+    - Returns labels as float [1,H,W] in [0,1] so trainer's '*255' restores 0..18 (and 250 for ignore).
     """
+
     def __init__(
         self,
         img_path: str,
@@ -27,6 +134,7 @@ class CelebAMaskHQ(Dataset):
         self.transform_img = transform_img
         self.transform_label = transform_label
         self.mode = mode  # True = train, False = val/test
+        self.augment = PairedAugment() if self.mode else None
 
         self.samples: List[Tuple[str, str]] = []
         self._build_index()
@@ -66,6 +174,11 @@ class CelebAMaskHQ(Dataset):
                 f"Do NOT use colorized masks."
             )
 
+        # Paired augmentations first (original resolution), train only
+        if self.augment is not None:
+            image, label = self.augment(image, label)
+
+        # Deterministic transforms (resize -> tensor / normalize)
         image = self.transform_img(image)
         label = self.transform_label(label)  # float [1,H,W] in [0,1]
         return image, label
@@ -87,7 +200,8 @@ class Data_Loader:
         if centercrop:
             ops.append(transforms.CenterCrop(160))
         if resize:
-            ops.append(transforms.Resize((self.imsize, self.imsize)))
+            # Explicitly use BILINEAR for RGB images
+            ops.append(transforms.Resize((self.imsize, self.imsize), interpolation=InterpolationMode.BILINEAR))
         if totensor:
             ops.append(transforms.ToTensor())  # float [0,1]
         if normalize:
@@ -122,8 +236,9 @@ class Data_Loader:
         loader = torch.utils.data.DataLoader(
             dataset=dataset,
             batch_size=self.batch,
-            shuffle=True,
-            num_workers=2,  # set to 0 temporarily for clearer tracebacks
+            shuffle=self.mode,     # shuffle only for train
+            num_workers=2,         # adjust as needed
+            pin_memory=True,
             drop_last=False,
         )
         return loader
