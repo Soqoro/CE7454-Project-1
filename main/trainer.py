@@ -60,7 +60,7 @@ class Trainer(object):
 
         # NEW (safe defaults if not in config)
         self.ignore_index = int(getattr(config, "ignore_index", 250))
-        self.dice_weight = float(getattr(config, "dice_weight", 1))
+        self.dice_weight = float(getattr(config, "dice_weight", 0))
         self.use_amp = bool(getattr(config, "use_amp", True))
         self.weight_decay = float(getattr(config, "weight_decay", 1e-4))
         self.poly_power = float(getattr(config, "poly_power", 0.9))
