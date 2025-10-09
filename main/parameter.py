@@ -9,7 +9,7 @@ def get_parameters():
 
     # Model hyper-parameters
     parser.add_argument('--model', type=str, default='parsenet', choices=['parsenet'])
-    parser.add_argument('--imsize', type=int, default=32)
+    parser.add_argument('--imsize', type=int, default=512)
     parser.add_argument('--version', type=str, default='parsenet')
 
     # Training setting

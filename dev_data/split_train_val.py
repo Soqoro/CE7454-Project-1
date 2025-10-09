@@ -4,7 +4,7 @@ import random
 from pathlib import Path
 import shutil
 
-def main(root=".", val_ratio=0.2, seed=42):
+def main(root=".", val_ratio=0.1, seed=42):
     root = Path(root)
     train_images = root / "train" / "images"
     train_masks  = root / "train" / "masks"
@@ -56,7 +56,7 @@ def main(root=".", val_ratio=0.2, seed=42):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=str, default=".", help="dataset root dir")
-    parser.add_argument("--val_ratio", type=float, default=0.2, help="fraction for validation set")
+    parser.add_argument("--val_ratio", type=float, default=0.1, help="fraction for validation set")
     parser.add_argument("--seed", type=int, default=42, help="random seed")
     args = parser.parse_args()
     main(args.root, args.val_ratio, args.seed)

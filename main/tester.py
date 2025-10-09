@@ -16,6 +16,13 @@ from PIL import Image
 from unet import unet
 from utils import generate_label_plain, generate_label
 
+def center_square_crop(img: Image.Image) -> Image.Image:
+    w, h = img.size
+    s = min(w, h)
+    left = (w - s) // 2
+    top  = (h - s) // 2
+    return img.crop((left, top, left + s, top + s))
+
 
 def transformer(resize: bool, totensor: bool, normalize: bool, centercrop: bool, imsize: int):
     """
@@ -87,7 +94,7 @@ class Tester(object):
 
         # New (optional) toggles
         self.use_amp = bool(getattr(config, "use_amp", True))
-        self.tta = bool(getattr(config, "tta", True))  # enable flip-TTA by default
+        self.tta = bool(getattr(config, "tta", False))  # Disable flip-TTA by default
 
         # Device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -138,7 +145,9 @@ class Tester(object):
 
             imgs = []
             for path in curr_paths:
-                img = transform(Image.open(path).convert("RGB"))
+                pil = Image.open(path).convert("RGB")
+                pil = center_square_crop(pil)
+                img = transform(pil)
                 imgs.append(img)
             imgs = torch.stack(imgs).to(self.device, non_blocking=True)
 

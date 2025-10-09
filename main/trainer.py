@@ -107,7 +107,7 @@ class Trainer(object):
             self.class_weights = self.class_weights.to(self.device)
 
         # AMP scaler (new API / import path)
-        self.scaler = GradScaler('cuda', enabled=(self.use_amp and torch.cuda.is_available()))
+        self.scaler = GradScaler(enabled=(self.use_amp and torch.cuda.is_available()))
 
         # Best val metric
         self.best_mf1 = -1.0
@@ -158,7 +158,7 @@ class Trainer(object):
 
             # labels: [B,1,H,W] float in [0,1] -> restore ids
             labels = labels.clone()
-            labels[:, 0, :, :] = labels[:, 0, :, :] * 255.0   # 0..18 / 250 (/possibly 255)
+            labels[:, 0, :, :] = torch.round(labels[:, 0, :, :] * 255.0)
 
             # targets (sanitize)
             labels_real_plain = labels[:, 0, :, :].to(self.device)  # [B,H,W] float
@@ -317,8 +317,10 @@ class Trainer(object):
         confusion = np.zeros((self.num_classes, self.num_classes), dtype=np.int64)
         for imgs, labels in loader:
             labels = labels.clone()
-            labels[:, 0, :, :] = labels[:, 0, :, :] * 255.0
-            labs = labels[:, 0, :, :].long().cpu().numpy()  # [B,H,W]
+            labels[:, 0, :, :] = torch.round(labels[:, 0, :, :] * 255.0)
+            labs_t = labels[:, 0, :, :].clamp_(0, 255)
+            labs_t[labs_t >= self.num_classes] = float(self.ignore_index)
+            labs = labs_t.long().cpu().numpy()  # [B,H,W]
 
             imgs = imgs.to(self.device, non_blocking=True)
             logits = self.G(imgs)

@@ -112,6 +112,15 @@ class PairedAugment:
         mask_out = TF.to_pil_image(mask_t)                     # back to PIL L
         return img_out, mask_out
 
+def paired_center_square_crop(img: Image.Image, mask: Image.Image) -> tuple[Image.Image, Image.Image]:
+    """Deterministic crop: take the largest centered square from both image and mask."""
+    w, h = img.size
+    s = min(w, h)
+    left = (w - s) // 2
+    top  = (h - s) // 2
+    box = (left, top, left + s, top + s)
+    return img.crop(box), mask.crop(box)
+
 
 class CelebAMaskHQ(Dataset):
     """
@@ -134,7 +143,7 @@ class CelebAMaskHQ(Dataset):
         self.transform_img = transform_img
         self.transform_label = transform_label
         self.mode = mode  # True = train, False = val/test
-        self.augment = PairedAugment() if self.mode else None
+        self.augment = None
 
         self.samples: List[Tuple[str, str]] = []
         self._build_index()
@@ -175,9 +184,9 @@ class CelebAMaskHQ(Dataset):
             )
 
         # Paired augmentations first (original resolution), train only
-        if self.augment is not None:
-            image, label = self.augment(image, label)
-
+        #if self.augment is not None:
+        #    image, label = self.augment(image, label)
+        image, label = paired_center_square_crop(image, label)
         # Deterministic transforms (resize -> tensor / normalize)
         image = self.transform_img(image)
         label = self.transform_label(label)  # float [1,H,W] in [0,1]
