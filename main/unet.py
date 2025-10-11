@@ -155,8 +155,8 @@ class UNet3Plus(nn.Module):
         self,
         *,
         num_classes: int = 19,
-        channels: Sequence[int] = (3, 16, 32, 64, 96, 128),
-        skip_ch: int = 12,
+        channels: Sequence[int] = (3, 32, 64, 128, 192, 256),
+        skip_ch: int = 16,
         dropout: float = 0.0,
         fast_up: bool = True,
     ) -> None:
