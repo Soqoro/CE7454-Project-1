@@ -159,7 +159,7 @@ class UNet3Plus(nn.Module):
         skip_ch: int = 28,
         dropout: float = 0.0,
         fast_up: bool = True,
-        deep_supervision: bool = True,   # <--- NEW: on by default (cheap aux heads)
+        deep_supervision: bool = True,   # NEW: on by default (cheap aux heads)
     ) -> None:
         super().__init__()
         self.encoder = U3PEncoderDefault(channels)
@@ -174,11 +174,16 @@ class UNet3Plus(nn.Module):
         # --- Deep supervision (aux heads: 1x1 conv -> num_classes) ---
         self.deep_supervision = deep_supervision
         if self.deep_supervision and self.num_decoders > 1:
-            # one aux head per earlier decoder stage (exclude the last)
-            self.aux_heads = nn.ModuleList(
-                [nn.Conv2d(decoder_ch, num_classes, kernel_size=1, padding=0)
-                 for _ in range(self.num_decoders - 1)]
-            )
+            # dec_maps[:-1] has (self.num_decoders - 1) items:
+            #   - dec_maps[0]: identity of bottom encoder map -> channels = bottom_ch
+            #   - dec_maps[1:]: fused maps -> channels = decoder_ch
+            bottom_ch = self.encoder.channels[-1]
+            aux_in_chs = [bottom_ch] + [decoder_ch] * (self.num_decoders - 2) if self.num_decoders >= 2 else []
+
+            self.aux_heads = nn.ModuleList([
+                nn.Conv2d(in_ch, num_classes, kernel_size=1, padding=0)
+                for in_ch in aux_in_chs
+            ])
         else:
             self.aux_heads = None
 
@@ -195,14 +200,16 @@ class UNet3Plus(nn.Module):
         If return_aux=True and deep_supervision=True, returns (final_logits, aux_logits_list).
         """
         _, _, h, w = x.shape
-        dec_maps = self.decoder(self.encoder(x))            # list length == self.num_decoders
+        dec_maps = self.decoder(self.encoder(x))  # list length == self.num_decoders
 
         # Final logits from last decoder stage
         logits = self.head(dec_maps[-1])
         logits = self._resize(logits, h, w)
 
         if return_aux and self.deep_supervision and self.aux_heads is not None:
-            # aux logits from earlier stages; heads are aligned with dec_maps[:-1]
+            # Safety check: one aux head per earlier decoder map
+            assert len(self.aux_heads) == len(dec_maps) - 1, \
+                f"Aux heads ({len(self.aux_heads)}) must match decoder maps ({len(dec_maps)-1})."
             aux_logits = []
             for head, m in zip(self.aux_heads, dec_maps[:-1]):
                 z = head(m)
@@ -216,4 +223,3 @@ class UNet3Plus(nn.Module):
 def unet(num_classes: int = 19, **kwargs) -> nn.Module:
     # keep signature flexible; deep_supervision defaults to True
     return UNet3Plus(num_classes=num_classes, **kwargs)
-
