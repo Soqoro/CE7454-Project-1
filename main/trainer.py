@@ -6,8 +6,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.amp.autocast_mode import autocast           # <- updated import
-from torch.amp.grad_scaler import GradScaler           # <- updated import
+from torch.amp.autocast_mode import autocast           # PyTorch AMP (new API)
+from torch.amp.grad_scaler import GradScaler           # PyTorch AMP (new API)
 from torchvision.utils import save_image
 
 from unet import unet
@@ -28,11 +28,11 @@ writer = SummaryWriter('runs/training')
 class Trainer(object):
     def __init__(self, data_loader, config):
         # ----------------- Data & config -----------------
-        self.data_loader = data_loader                   # train loader
+        self.data_loader = data_loader                        # train loader
         self.val_loader = getattr(config, "val_loader", None)  # may be None
 
-        # exact model and loss (kept for compat)
-        self.model = config.model
+        # exact model (optional external model injection)
+        self.model = getattr(config, "model", None)
 
         # Hyper-parameters / paths
         self.imsize = config.imsize
@@ -58,9 +58,10 @@ class Trainer(object):
         self.model_save_step = config.model_save_step
         self.version = config.version
 
-        # NEW (safe defaults if not in config)
+        # --- NEW knobs / safe defaults ---
         self.ignore_index = int(getattr(config, "ignore_index", 250))
-        self.dice_weight = float(getattr(config, "dice_weight", 1))
+        self.dice_weight = float(getattr(config, "dice_weight", 1.0))
+        self.aux_weight = float(getattr(config, "aux_weight", 0.4))       # total weight for all aux heads
         self.use_amp = bool(getattr(config, "use_amp", True))
         self.weight_decay = float(getattr(config, "weight_decay", 1e-4))
         self.poly_power = float(getattr(config, "poly_power", 0.9))
@@ -72,7 +73,7 @@ class Trainer(object):
         # Device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Paths
+        # Paths (versioned)
         self.log_path = os.path.join(self.log_path, self.version)
         self.sample_path = os.path.join(self.sample_path, self.version)
         self.model_save_path = os.path.join(self.model_save_path, self.version)
@@ -87,11 +88,11 @@ class Trainer(object):
         if self.use_tensorboard:
             self.build_tensorboard()
 
-        # Start with trained model (resume)
+        # Optionally resume from checkpoint step
         if self.pretrained_model:
             self.load_pretrained_model()
 
-        # Class weights (optional)
+        # Optional class weights (for CE)
         self.class_weights = None
         if self.use_class_weights:
             if self.class_weights_path and os.path.isfile(self.class_weights_path):
@@ -106,13 +107,13 @@ class Trainer(object):
                 print("Saved class weights to checkpoints directory.")
             self.class_weights = self.class_weights.to(self.device)
 
-        # AMP scaler (new API / import path)
+        # AMP scaler (new API)
         self.scaler = GradScaler(enabled=(self.use_amp and torch.cuda.is_available()))
 
-        # Best val metric
+        # Track best validation macro-F1
         self.best_mf1 = -1.0
 
-        # Optionally build a val loader if config provides paths (only if not already passed in)
+        # Optionally build a val loader if config provides paths (and none was passed)
         if self.val_loader is None and hasattr(config, "val_img_path") and hasattr(config, "val_label_path"):
             try:
                 from data_loader import Data_Loader  # local import to avoid circulars
@@ -144,7 +145,7 @@ class Trainer(object):
         for step in range(start, self.total_step):
             self.G.train()
 
-            # Poly LR
+            # Polynomial LR decay
             lr = self.g_lr * (1.0 - float(step) / float(max(1, self.total_step))) ** self.poly_power
             for pg in self.g_optimizer.param_groups:
                 pg["lr"] = lr
@@ -156,23 +157,23 @@ class Trainer(object):
                 data_iter = iter(self.data_loader)
                 imgs, labels = next(data_iter)
 
-            # labels: [B,1,H,W] float in [0,1] -> restore ids
+            # labels: [B,1,H,W] float in [0,1] -> restore ids to [0..255]
             labels = labels.clone()
             labels[:, 0, :, :] = torch.round(labels[:, 0, :, :] * 255.0)
 
-            # targets (sanitize)
+            # Targets (sanitize) -> [B,H,W], ignore out-of-range to ignore_index
             labels_real_plain = labels[:, 0, :, :].to(self.device)  # [B,H,W] float
             labels_real_plain = labels_real_plain.clamp_(0, 255)
-            # Any id >= num_classes (e.g., 250, 255) -> ignore_index
             oob = labels_real_plain >= self.num_classes
             labels_real_plain[oob] = float(self.ignore_index)
 
-            # For visualization, build safe one-hot without touching training labels
-            labels_index_long = labels[:, 0, :, :].long()           # CPU float->long ok for viz path
-            # Replace ignore with 0, clamp all values into [0, C-1]
-            labels_vis = torch.where(labels_index_long == self.ignore_index,
-                                     torch.zeros_like(labels_index_long),
-                                     labels_index_long)
+            # For visualization (color maps), build safe one-hot (without touching training labels)
+            labels_index_long = labels[:, 0, :, :].long()  # CPU float->long
+            labels_vis = torch.where(
+                labels_index_long == self.ignore_index,
+                torch.zeros_like(labels_index_long),
+                labels_index_long
+            )
             labels_vis = labels_vis.clamp_(0, self.num_classes - 1)
             labels_real = F.one_hot(labels_vis, num_classes=self.num_classes).permute(0, 3, 1, 2).float().to(self.device)
 
@@ -180,10 +181,18 @@ class Trainer(object):
 
             # ================== Train G =================== #
             self.reset_grad()
-            dice_value = torch.tensor(0.0, device=self.device)  # pre-init for logging
+            dice_value = torch.tensor(0.0, device=self.device)  # init for logging
+            loss_aux_val = 0.0
 
             with autocast('cuda', enabled=(self.use_amp and torch.cuda.is_available())):
-                logits = self.G(imgs)  # [B,C,H,W]
+                # --- Deep supervision aware forward ---
+                out = self.G(imgs, return_aux=True)  # if model doesn't support, fallback below
+                if isinstance(out, tuple) and len(out) == 2:
+                    logits, aux_list = out
+                else:
+                    logits, aux_list = out, []
+
+                # Main loss (CE + optional Dice)
                 ce = cross_entropy2d(
                     logits,
                     labels_real_plain.long(),
@@ -192,9 +201,28 @@ class Trainer(object):
                 )
                 if self.dice_weight > 0.0:
                     dice_value = soft_dice_loss(logits, labels_real_plain.long(), ignore_index=self.ignore_index)
-                    loss = ce + self.dice_weight * dice_value
+                    loss_main = ce + self.dice_weight * dice_value
                 else:
-                    loss = ce
+                    loss_main = ce
+
+                # Aux losses (distributed total weight across aux heads)
+                loss_aux = torch.tensor(0.0, device=self.device)
+                if aux_list:
+                    lam = float(self.aux_weight) / len(aux_list)
+                    for aux_logits in aux_list:
+                        ce_a = cross_entropy2d(
+                            aux_logits,
+                            labels_real_plain.long(),
+                            weight=self.class_weights,
+                            ignore_index=self.ignore_index,
+                        )
+                        if self.dice_weight > 0.0:
+                            dice_a = soft_dice_loss(aux_logits, labels_real_plain.long(), ignore_index=self.ignore_index)
+                            loss_aux = loss_aux + lam * (ce_a + self.dice_weight * dice_a)
+                        else:
+                            loss_aux = loss_aux + lam * ce_a
+
+                loss = loss_main + loss_aux
 
             # Backward, clip, step
             self.scaler.scale(loss).backward()
@@ -208,22 +236,27 @@ class Trainer(object):
                 elapsed = time.time() - start_time
                 elapsed = str(datetime.timedelta(seconds=int(elapsed)))
 
-                # detach + item() to avoid UserWarning
                 ce_val   = ce.detach().item()
                 loss_val = loss.detach().item()
                 dice_val = dice_value.detach().item() if self.dice_weight > 0.0 else 0.0
+                if aux_list:
+                    loss_aux_val = loss_aux.detach().item()
 
                 msg = (f"Elapsed [{elapsed}], G_step [{step + 1}/{self.total_step}], "
                        f"lr={lr:.6f}, CE: {ce_val:.4f}")
                 if self.dice_weight > 0.0:
                     msg += f", Dice: {dice_val:.4f}"
-                msg += f", Loss: {loss_val:.4f}"
+                if aux_list:
+                    msg += f", Aux: {loss_aux_val:.4f}"
+                msg += f", Total: {loss_val:.4f}"
                 print(msg)
 
                 writer.add_scalar('Opt/lr', lr, step)
                 writer.add_scalar('Loss/CE', ce_val, step)
                 if self.dice_weight > 0.0:
                     writer.add_scalar('Loss/Dice', dice_val, step)
+                if aux_list:
+                    writer.add_scalar('Loss/Aux', loss_aux_val, step)
                 writer.add_scalar('Loss/Total', loss_val, step)
 
             # ---- Visualize labels (real vs predict) ----
@@ -231,7 +264,7 @@ class Trainer(object):
                 label_batch_predict = generate_label(logits, self.imsize)     # Tensor [B,3,H,W]
                 label_batch_real = generate_label(labels_real, self.imsize)   # Tensor [B,3,H,W]
 
-            # TBX images
+            # TBX images (first N in a horizontal strip)
             B = imgs.shape[0]
             img_combine = imgs[0]
             real_combine = label_batch_real[0]
@@ -248,7 +281,7 @@ class Trainer(object):
             # ---- Sample grid save ----
             if (step + 1) % self.sample_step == 0:
                 with torch.no_grad():
-                    labels_sample = self.G(imgs)
+                    labels_sample = self.G(imgs)  # final logits only (no aux)
                     labels_sample = generate_label(labels_sample, self.imsize)  # Tensor
                     labels_sample = labels_sample.detach().cpu().float()
                 save_image(labels_sample, os.path.join(self.sample_path, f'{step + 1}_predict.png'))
@@ -274,7 +307,8 @@ class Trainer(object):
         print(f'Final checkpoint saved to {os.path.join(self.model_save_path, "latest_G.pth")}')
 
     def build_model(self):
-        self.G = unet().to(self.device)
+        # Instantiate model; pass num_classes to keep it explicit
+        self.G = unet(num_classes=self.num_classes).to(self.device)
         if self.parallel:
             self.G = nn.DataParallel(self.G)
 
@@ -299,9 +333,11 @@ class Trainer(object):
             self.logger = None
 
     def load_pretrained_model(self):
-        self.G.load_state_dict(torch.load(os.path.join(
-            self.model_save_path, '{}_G.pth'.format(self.pretrained_model)), map_location=self.device))
-        print('loaded trained models (step: {})..!'.format(self.pretrained_model))
+        self.G.load_state_dict(torch.load(
+            os.path.join(self.model_save_path, f'{self.pretrained_model}_G.pth'),
+            map_location=self.device
+        ))
+        print(f'Loaded trained models (step: {self.pretrained_model})..!')
 
     def reset_grad(self):
         self.g_optimizer.zero_grad(set_to_none=True)
@@ -323,7 +359,7 @@ class Trainer(object):
             labs = labs_t.long().cpu().numpy()  # [B,H,W]
 
             imgs = imgs.to(self.device, non_blocking=True)
-            logits = self.G(imgs)
+            logits = self.G(imgs)                              # final logits only
             preds = torch.argmax(logits, dim=1).cpu().numpy()  # [B,H,W]
 
             for p, t in zip(preds, labs):

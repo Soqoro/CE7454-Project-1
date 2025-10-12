@@ -159,14 +159,28 @@ class UNet3Plus(nn.Module):
         skip_ch: int = 28,
         dropout: float = 0.0,
         fast_up: bool = True,
+        deep_supervision: bool = True,   # <--- NEW: on by default (cheap aux heads)
     ) -> None:
         super().__init__()
         self.encoder = U3PEncoderDefault(channels)
         self.decoder = U3PDecoder(self.encoder.channels[1:], skip_ch=skip_ch, dropout=dropout, fast_up=fast_up)
 
-        num_decoders = len(self.encoder.channels) - 1
-        decoder_ch = skip_ch * num_decoders
+        self.num_decoders = len(self.encoder.channels) - 1
+        decoder_ch = skip_ch * self.num_decoders
+
+        # Main head (keep 3x3 as before)
         self.head = nn.Conv2d(decoder_ch, num_classes, kernel_size=3, padding=1)
+
+        # --- Deep supervision (aux heads: 1x1 conv -> num_classes) ---
+        self.deep_supervision = deep_supervision
+        if self.deep_supervision and self.num_decoders > 1:
+            # one aux head per earlier decoder stage (exclude the last)
+            self.aux_heads = nn.ModuleList(
+                [nn.Conv2d(decoder_ch, num_classes, kernel_size=1, padding=0)
+                 for _ in range(self.num_decoders - 1)]
+            )
+        else:
+            self.aux_heads = None
 
         self.apply(_weight_init)
 
@@ -175,12 +189,31 @@ class UNet3Plus(nn.Module):
             x = F.interpolate(x, size=(h, w), mode="bilinear", align_corners=True)
         return x
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, return_aux: bool = False):
+        """
+        By default returns only the final logits (backward-compatible).
+        If return_aux=True and deep_supervision=True, returns (final_logits, aux_logits_list).
+        """
         _, _, h, w = x.shape
-        dec_maps = self.decoder(self.encoder(x))
+        dec_maps = self.decoder(self.encoder(x))            # list length == self.num_decoders
+
+        # Final logits from last decoder stage
         logits = self.head(dec_maps[-1])
-        return self._resize(logits, h, w)
+        logits = self._resize(logits, h, w)
+
+        if return_aux and self.deep_supervision and self.aux_heads is not None:
+            # aux logits from earlier stages; heads are aligned with dec_maps[:-1]
+            aux_logits = []
+            for head, m in zip(self.aux_heads, dec_maps[:-1]):
+                z = head(m)
+                z = self._resize(z, h, w)
+                aux_logits.append(z)
+            return logits, aux_logits
+
+        return logits
 
 
-def unet(num_classes: int = 19) -> nn.Module:
-    return UNet3Plus(num_classes=num_classes)
+def unet(num_classes: int = 19, **kwargs) -> nn.Module:
+    # keep signature flexible; deep_supervision defaults to True
+    return UNet3Plus(num_classes=num_classes, **kwargs)
+
